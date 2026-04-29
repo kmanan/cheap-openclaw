@@ -2,7 +2,9 @@
 
 14 production-tested techniques to cut your OpenClaw agent costs by 10x.
 
-These aren't theories — they're battle-tested optimizations running in production on a 24/7 autonomous OpenClaw agent that handles iMessage conversations, scheduled briefings, health monitoring, email scanning, and household automation. Every technique includes the config, the rationale, and what went wrong when we got it wrong.
+I run OpenClaw as my family's autonomous butler — [Spratt](https://github.com/kmanan/spratt-skills). He handles iMessage conversations, morning briefings, evening digests, health monitoring, email scanning, grocery tracking, flight alerts, and household automation, 24/7. The skills I built for that are in the [spratt-skills](https://github.com/kmanan/spratt-skills) repo.
+
+Below is every cost and performance optimization that emerged from running Spratt in production. These aren't theories — they're battle-tested against a month of real traffic, real cron jobs, and many painful cost spikes. Every technique includes the config, the rationale, and what went wrong when we got it wrong.
 
 ---
 
@@ -642,4 +644,4 @@ MIT
 
 ---
 
-*Built by [@kmanan](https://github.com/kmanan) running [Spratt](https://github.com/kmanan/spratt-butler), a 24/7 OpenClaw agent. These optimizations emerged from a month of production operation and many painful cost spikes.*
+*Built by [@kmanan](https://github.com/kmanan) running [Spratt](https://github.com/kmanan/spratt-skills), a 24/7 autonomous OpenClaw family butler. These optimizations emerged from a month of production operation and many painful cost spikes.*
