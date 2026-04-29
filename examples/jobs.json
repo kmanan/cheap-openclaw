@@ -1,0 +1,75 @@
+{
+  "// EXAMPLE CRON JOBS": "Shows model tiering and lightContext patterns",
+
+  "jobs": [
+    {
+      "// pattern": "CONTENT COMPOSITION — Haiku + lightContext",
+      "// rationale": "Briefings are 90% data retrieval, 10% formatting. Haiku is great at this.",
+      "name": "Morning Briefing",
+      "enabled": true,
+      "schedule": "0 8 * * *",
+      "model": "anthropic/claude-haiku-4-5-20251001",
+      "sessionTarget": "isolated",
+      "lightContext": true,
+      "timeout": 180,
+      "payload": {
+        "kind": "agentTurn",
+        "message": "Run the morning briefing pipeline: lobster run morning-briefing.lobster"
+      }
+    },
+    {
+      "name": "Evening Digest",
+      "enabled": true,
+      "schedule": "0 20 * * *",
+      "model": "anthropic/claude-haiku-4-5-20251001",
+      "sessionTarget": "isolated",
+      "lightContext": true,
+      "timeout": 180,
+      "payload": {
+        "kind": "agentTurn",
+        "message": "Run the evening digest pipeline: lobster run evening-digest.lobster"
+      }
+    },
+    {
+      "// pattern": "ORCHESTRATION / CHECKS — Flash + lightContext",
+      "// rationale": "Health checks just run scripts and report results. Cheapest model.",
+      "name": "Health Check",
+      "enabled": true,
+      "schedule": "0 */6 * * *",
+      "model": "google/gemini-2.5-flash",
+      "sessionTarget": "isolated",
+      "lightContext": true,
+      "timeout": 120,
+      "payload": {
+        "kind": "agentTurn",
+        "message": "Run the health check script and report any issues."
+      }
+    },
+    {
+      "// pattern": "DETERMINISTIC WORK — exec payload (zero tokens)",
+      "// rationale": "Backup is a shell script. No LLM needed.",
+      "// caveat": "exec does NOT work with sessionTarget: isolated — use launchd/cron instead",
+      "name": "Nightly Backup",
+      "enabled": true,
+      "schedule": "0 2 * * *",
+      "payload": {
+        "kind": "exec",
+        "command": "/path/to/backup.sh"
+      }
+    },
+    {
+      "// pattern": "DATA-INTENSIVE — Flash without lightContext",
+      "// rationale": "Needs full agent context for classification rules in AGENTS.md",
+      "name": "Email Scan",
+      "enabled": true,
+      "schedule": "*/30 * * * *",
+      "model": "google/gemini-2.5-flash",
+      "sessionTarget": "isolated",
+      "lightContext": false,
+      "payload": {
+        "kind": "agentTurn",
+        "message": "Scan inbox for new emails and classify them."
+      }
+    }
+  ]
+}

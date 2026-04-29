@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openclaw.cron-session-cleanup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Update these paths for your system -->
+        <string>/usr/bin/python3</string>
+        <string>/path/to/cheap-openclaw/scripts/cron-session-cleanup.py</string>
+        <string>--agent</string>
+        <string>your-agent-name</string>
+        <string>--log-file</string>
+        <string>/tmp/cron-session-cleanup.log</string>
+    </array>
+
+    <!-- Run daily at 3:30 AM -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/cron-session-cleanup.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/cron-session-cleanup.stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
