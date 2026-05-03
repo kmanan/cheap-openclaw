@@ -363,6 +363,7 @@ Symptoms:
 - Haiku returns empty responses (overwhelmed by stale context)
 - Token usage climbs steadily over days/weeks
 - Flash survives longer but eventually rots too
+- **GCP bill explodes.** In our case, Gemini API costs went from ~$4/month to $64.74/month — a 1,571% increase — entirely from input token growth caused by session rot. Every cron run replays the full accumulated history as input tokens. With multiple jobs running daily (some 3x/day), the compounding cost is severe.
 
 ### The Fix
 
@@ -383,6 +384,36 @@ Schedule it via cron, launchd, or systemd:
 Or on macOS via launchd (see [`examples/com.openclaw.cron-session-cleanup.plist`](examples/com.openclaw.cron-session-cleanup.plist)).
 
 > **Note:** This is a workaround for an upstream issue in OpenClaw/lossless-claw. If a future version adds native session rotation for isolated cron jobs, this script becomes unnecessary.
+
+### Don't Forget the Heartbeat
+
+The gateway's built-in heartbeat agent uses a persistent session key (`agent:spratt-heartbeat:main:heartbeat`) that rots the same way cron jobs do — but it's not in `jobs.json`, so the cleanup script won't find it. Add heartbeat cleanup to your script:
+
+```python
+# In addition to cron job cleanup:
+cur = conn.execute(
+    "UPDATE conversations SET active = 0, archived_at = datetime('now') "
+    "WHERE session_key LIKE '%heartbeat%' AND active = 1",
+)
+```
+
+In our case, the heartbeat accumulated 7,535 messages over 19 days and was replaying all of them every 30 minutes.
+
+### Gmail `newer_than:` is Broken
+
+If your heartbeat or cron jobs use `gog gmail search` with `newer_than:`, be aware that **`newer_than:` silently fails when combined with other operators** like `is:unread`. Gmail returns all matching results, ignoring the time filter entirely. This means your agent processes the entire inbox on every run instead of just recent emails.
+
+Use `after:` with epoch seconds instead:
+
+```bash
+# Broken — newer_than silently ignored when combined with is:unread
+gog gmail search "is:unread newer_than:30m" -a account@gmail.com
+
+# Fixed — after: with epoch works correctly
+gog gmail search "is:unread after:$(date -v-30M +%s)" -a account@gmail.com
+```
+
+This applies to any Gmail query that combines `newer_than:` with other search operators. We caught it because the heartbeat was re-alerting about a 3-week-old email every 30 minutes.
 
 ---
 
@@ -615,7 +646,7 @@ After 60 minutes of inactivity, the session resets. The next interaction starts 
 | lightContext | Minimal bootstrap for cron jobs | ~80% per cron turn |
 | Bootstrap optimization | Move reference data to lazy-loaded skills | ~15-20% per turn |
 | Fallback chain | Flash -> Haiku (not Sonnet) on 429s | Prevents 10x spike events |
-| Session cleanup | Daily cron session rot prevention | Prevents unbounded growth |
+| Session cleanup | Daily cron session rot prevention | Prevented a 16x cost spike ($4 → $65/mo) |
 | Reply suppression | No intermediate messages | Reduces output + history |
 | Subagent assignment | Flash for all subagents | ~10x vs. Sonnet |
 | Compaction | Haiku-based summarization | Cheap context management |
