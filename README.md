@@ -1,6 +1,6 @@
 # cheap-openclaw
 
-14 production-tested techniques to cut your OpenClaw agent costs by 10x.
+15 production-tested techniques to cut your OpenClaw agent costs by 10x.
 
 I run OpenClaw as my family's autonomous butler — [Spratt](https://github.com/kmanan/spratt-skills). He handles iMessage conversations, morning briefings, evening digests, health monitoring, email scanning, grocery tracking, flight alerts, and household automation, 24/7. The skills I built for that are in the [spratt-skills](https://github.com/kmanan/spratt-skills) repo.
 
@@ -24,6 +24,7 @@ Below is every cost and performance optimization that emerged from running Sprat
 12. [Usage Tracking](#12-usage-tracking)
 13. [Prompt Compression](#13-prompt-compression)
 14. [Session Reset on Idle](#14-session-reset-on-idle)
+15. [Move High-Volume Extraction to Subscription-Backed Codex](#15-move-high-volume-extraction-to-subscription-backed-codex)
 
 ---
 
@@ -34,8 +35,9 @@ If you want the biggest wins with the least effort, do these three first:
 1. **Deploy a model router** for interactive sessions ([iblai-openclaw-router](https://github.com/iblai/iblai-openclaw-router)) — routes 80% of messages to Haiku instead of Sonnet. ~4x savings.
 2. **Enable prompt caching** on Haiku (`cacheRetention: "short"`) — 90% discount on cached input tokens for your highest-volume model.
 3. **Set `lightContext: true`** on all cron jobs that don't need full agent context — eliminates ~15-20K chars of bootstrap re-injection per cron turn.
+4. **Move high-volume extraction jobs off metered API models** when you already pay for a subscription-backed provider like OpenAI Codex. Keep the LLM for language/extraction, but isolate deterministic writes so the swap is safe.
 
-Combined, these three changes alone can cut your bill by 5-8x.
+Combined, these changes can cut your bill by 5-8x, and the fourth one prevents a "cheap" extraction pipeline from quietly becoming an $80/month metered API workload.
 
 ---
 
@@ -118,6 +120,7 @@ After tuning: **80% LIGHT (Haiku), 20% MEDIUM (Sonnet)** across 564 routing deci
 |---|---|---|
 | Briefings, digests, summaries | Claude Haiku 4.5 | 90% data retrieval, 10% formatting. Haiku is great at structured formatting. |
 | Health checks, scrapers, inspections | Gemini Flash | Orchestration work. Cheapest option at $0.30/$2.50 per M. |
+| High-volume classification/extraction pipelines | Subscription-backed Codex where available | Use your fixed subscription instead of paying per-token API rates. |
 | Interactive sessions | Router (see above) | Per-turn routing. |
 
 ### Example jobs.json
@@ -145,7 +148,7 @@ After tuning: **80% LIGHT (Haiku), 20% MEDIUM (Sonnet)** across 564 routing deci
 
 ### Cost Difference
 
-Switching briefings from Sonnet ($3/$15) to Haiku ($0.80/$4) is a **~12x cost reduction** on those jobs. Switching orchestration from Haiku to Flash ($0.30/$2.50) saves another ~3x.
+Switching briefings from Sonnet ($3/$15) to Haiku ($0.80/$4) is a **~12x cost reduction** on those jobs. Switching orchestration from Haiku to Flash ($0.30/$2.50) saves another ~3x. For high-volume extraction jobs, moving from metered Gemini Flash to a subscription-backed Codex route can remove that workload from your variable API bill entirely.
 
 ### Pitfall: Don't Let Claude "Optimize" Your Models
 
@@ -363,7 +366,7 @@ Symptoms:
 - Haiku returns empty responses (overwhelmed by stale context)
 - Token usage climbs steadily over days/weeks
 - Flash survives longer but eventually rots too
-- **GCP bill explodes.** In our case, Gemini API costs went from ~$4/month to $64.74/month — a 1,571% increase — entirely from input token growth caused by session rot. Every cron run replays the full accumulated history as input tokens. With multiple jobs running daily (some 3x/day), the compounding cost is severe.
+- **GCP bill explodes.** In our case, Gemini API costs went from ~$4/month to $64.74/month — a 1,571% increase — entirely from input token growth caused by session rot. Every cron run replays the full accumulated history as input tokens. With multiple jobs running daily (some 3x/day), the compounding cost is severe. Later, even after session cleanup, high-volume email extraction still showed roughly $80/month of Gemini spend; see technique #15 for the separate fix.
 
 ### The Fix
 
@@ -635,6 +638,115 @@ After 60 minutes of inactivity, the session resets. The next interaction starts 
 
 ---
 
+## 15. Move High-Volume Extraction to Subscription-Backed Codex
+
+**The idea:** Some workloads genuinely need an LLM, but they do not need to stay on a metered API model if you already pay for a subscription-backed model route. Email triage and extraction is the best example: the model should decide what an email means, but deterministic code should execute the writes.
+
+### What We Found
+
+Gemini Flash looked cheap enough for scheduled email scanning, but in production it was still consuming roughly **$80/month** once all the repeated header triage, body extraction, PDF extraction, retries, and context overhead were included.
+
+That spend survived earlier optimizations because the architecture still had two direct Gemini call sites:
+
+```
+gather email headers -> Gemini header classification -> Gemini body/PDF extraction -> deterministic writes
+```
+
+The important distinction: the problem was not "LLM vs no LLM." Email classification and extraction are language tasks. The problem was leaving a high-volume language task on a metered API when an already-paid subscription-backed Codex route was available.
+
+### The Architecture Change
+
+Split the pipeline into explicit stages:
+
+```
+gather -> decide -> extract actions -> run actions
+```
+
+| Stage | Uses LLM? | Responsibility |
+|---|---:|---|
+| `gather` | No | Fetch recent headers from email providers. |
+| `decide` | Yes | Cheap header-only triage: skip vs actionable category. |
+| `extract actions` | Yes | Read only actionable bodies/PDFs and produce structured JSON actions. |
+| `run actions` | No | Write orders/trips/reminders/outbox and mark email read after success. |
+
+This preserves the two-stage cost optimization:
+
+1. First LLM pass sees only headers.
+2. Second LLM pass runs only for actionable emails.
+3. The final write path has no model calls.
+
+### The Model Change
+
+Replace direct Gemini HTTP calls:
+
+```python
+https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent
+```
+
+with OpenClaw gateway inference:
+
+```bash
+openclaw infer model run \
+  --gateway \
+  --model openai-codex/gpt-5.5 \
+  --json \
+  --prompt "$PROMPT"
+```
+
+This keeps the call on OpenClaw's supported model surface instead of inventing a direct provider integration.
+
+### PDF Attachments
+
+Do not bolt on a local PDF parser as a workaround. Use OpenClaw's PDF stack.
+
+For interactive/manual flows, use the native `pdf` tool. For scheduled scripts, use OpenClaw's bundled document extraction plugin for PDF text extraction, then send that extracted text to Codex for structured JSON.
+
+The important rule:
+
+```
+PDF bytes -> OpenClaw document-extract/pdf -> extracted text -> Codex structured extraction -> deterministic writes
+```
+
+That avoids paying Gemini for inline PDF extraction and avoids fragile ad hoc parsers.
+
+### Validation Checklist
+
+Before turning this on, verify:
+
+- The Codex route works:
+
+  ```bash
+  openclaw infer model run --gateway --model openai-codex/gpt-5.5 --json --prompt '{"ok":true}'
+  ```
+
+- The live scripts no longer contain direct Gemini/model-key calls:
+
+  ```bash
+  rg -n "gemini|GEMINI|generateContent|API_KEY|call_flash" path/to/email-scan
+  ```
+
+- Synthetic daycare/school email produces an action instead of being skipped.
+- Synthetic travel PDF produces structured flight data.
+- The deterministic runner passes `--dry-run`.
+- Real writes and mark-read happen only after successful deterministic execution.
+
+### What This Saves
+
+In our production setup, this moved email scanning's LLM spend off the Gemini API path. The exact savings depend on your subscription and volume, but the target was an observed **~$80/month Gemini workload** that should not have been variable API spend.
+
+### Caveat
+
+Codex is not automatically cheaper for every workload. This optimization makes sense when:
+
+- You already pay for a subscription-backed Codex/OpenAI route.
+- The workload is high-volume and language-heavy.
+- You can keep deterministic writes outside the LLM.
+- You validate quality on the specific cases you care about.
+
+Do not move deterministic shell scripts to Codex. Move only the language/extraction stages.
+
+---
+
 ## Summary
 
 | Technique | What It Does | Savings |
@@ -653,6 +765,7 @@ After 60 minutes of inactivity, the session resets. The next interaction starts 
 | Usage tracking | CSV logging + daily reports | Catches regressions |
 | Prompt compression | Terse prompts, pre-structured data | Per-prompt savings |
 | Session reset | Idle session reset | Prevents stale carry |
+| Codex for extraction | Move high-volume language extraction off metered Gemini | Removed an observed ~$80/mo variable API workload |
 
 ---
 
