@@ -25,6 +25,7 @@ Below is every cost and performance optimization that emerged from running Sprat
 13. [Prompt Compression](#13-prompt-compression)
 14. [Session Reset on Idle](#14-session-reset-on-idle)
 15. [Move High-Volume Extraction to Subscription-Backed Codex](#15-move-high-volume-extraction-to-subscription-backed-codex)
+16. [Ambient Monitor (Heartbeat) Configuration](#16-ambient-monitor-heartbeat-configuration)
 
 ---
 
@@ -368,32 +369,87 @@ Symptoms:
 - Flash survives longer but eventually rots too
 - **GCP bill explodes.** In our case, Gemini API costs went from ~$4/month to $64.74/month — a 1,571% increase — entirely from input token growth caused by session rot. Every cron run replays the full accumulated history as input tokens. With multiple jobs running daily (some 3x/day), the compounding cost is severe. Later, even after session cleanup, high-volume email extraction still showed roughly $80/month of Gemini spend; see technique #15 for the separate fix.
 
-### The Fix
+### The Native Fix (lossless-claw 0.9.4+)
 
-Run [`scripts/cron-session-cleanup.py`](scripts/cron-session-cleanup.py) daily. It:
+As of `lossless-claw` 0.9.4, the plugin supports `ignoreSessionPatterns` — sessions matching these glob patterns are entirely skipped: no conversation rows, no messages, no participation in compaction. This is the proper upstream fix.
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "enabled": true,
+        "config": {
+          "summaryModel": "anthropic/claude-haiku-4-5-20251001",
+          "ignoreSessionPatterns": [
+            "agent:*:cron:**",
+            "agent:<your-heartbeat-agent>:**"
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+Patterns we use:
+- `agent:*:cron:**` — every isolated cron run, across every agent
+- `agent:spratt-heartbeat:**` — the persistent heartbeat session
+
+The gateway hot-reloads this config — no restart strictly needed, but verify with one. After applying, every fire of a matching session leaves `lcm.db` untouched: no new conversation row, no message inserts, `updated_at` doesn't advance. We confirmed it empirically by snapshotting `lcm.db` before a heartbeat fire and after — message counts stayed flat while the gateway log still showed `agent:spratt-heartbeat:main:heartbeat` activity.
+
+### Verify Your Plugin Version
+
+```bash
+# Check the loaded extension version
+grep -E '"version"' ~/.openclaw/extensions/lossless-claw/package.json
+
+# Confirm the option is implemented in the bundled dist
+grep -c 'ignoreSessionPattern' ~/.openclaw/extensions/lossless-claw/dist/index.js
+```
+
+If the count is `0`, your version doesn't implement the option yet — fall back to the cleanup script below.
+
+### One-Time Backfill
+
+Adding `ignoreSessionPatterns` only stops *future* ingestion. The accumulated junk in `lcm.db` is still there. Bulk-clean it once:
+
+```sql
+-- Run inside a transaction. Back up lcm.db first.
+DELETE FROM messages WHERE conversation_id IN (
+    SELECT conversation_id FROM conversations
+    WHERE session_key LIKE 'agent:%:cron:%'
+       OR session_key LIKE 'agent:<your-heartbeat-agent>:%'
+);
+DELETE FROM conversations
+WHERE session_key LIKE 'agent:%:cron:%'
+   OR session_key LIKE 'agent:<your-heartbeat-agent>:%';
+-- Repeat for child tables: summaries, message_parts, summary_messages,
+-- context_items, large_files, conversation_bootstrap_state,
+-- conversation_compaction_telemetry, conversation_compaction_maintenance.
+-- Then rebuild FTS indexes and VACUUM.
+```
+
+In our case this dropped `lcm.db` from 179 MB to 155 MB and removed 12,712 stale messages across 88 conversations.
+
+### The Cleanup Script (still useful as defense in depth, or required pre-0.9.4)
+
+[`scripts/cron-session-cleanup.py`](scripts/cron-session-cleanup.py) runs daily and:
 
 1. Reads `jobs.json` to find all enabled isolated cron jobs
 2. Removes their session entries from `sessions.json`
-3. Deactivates their conversations in `lcm.db` (the lossless-claw database)
+3. Deactivates their conversations in `lcm.db`
 4. Archives transcript files with 4-week retention
 
-Schedule it via cron, launchd, or systemd:
+Schedule it via cron, launchd, or systemd. On macOS via launchd see [`examples/com.openclaw.cron-session-cleanup.plist`](examples/com.openclaw.cron-session-cleanup.plist).
 
-```bash
-# Run daily at 3:30 AM
-0 3 30 * * * python3 /path/to/cron-session-cleanup.py
-```
-
-Or on macOS via launchd (see [`examples/com.openclaw.cron-session-cleanup.plist`](examples/com.openclaw.cron-session-cleanup.plist)).
-
-> **Note:** This is a workaround for an upstream issue in OpenClaw/lossless-claw. If a future version adds native session rotation for isolated cron jobs, this script becomes unnecessary.
+Even with `ignoreSessionPatterns`, the script is useful as belt-and-suspenders: it catches sessions that match a different shape than your patterns expected, and it archives transcripts that the runtime keeps even when ingestion is skipped.
 
 ### Don't Forget the Heartbeat
 
-The gateway's built-in heartbeat agent uses a persistent session key (`agent:spratt-heartbeat:main:heartbeat`) that rots the same way cron jobs do — but it's not in `jobs.json`, so the cleanup script won't find it. Add heartbeat cleanup to your script:
+The gateway's built-in heartbeat agent uses a persistent session key (`agent:spratt-heartbeat:main:heartbeat`) that rots the same way cron jobs do. Add it to your `ignoreSessionPatterns` (preferred), or to the cleanup script:
 
 ```python
-# In addition to cron job cleanup:
 cur = conn.execute(
     "UPDATE conversations SET active = 0, archived_at = datetime('now') "
     "WHERE session_key LIKE '%heartbeat%' AND active = 1",
@@ -747,6 +803,105 @@ Do not move deterministic shell scripts to Codex. Move only the language/extract
 
 ---
 
+## 16. Ambient Monitor (Heartbeat) Configuration
+
+**The idea:** A "heartbeat" agent that fires every 30 minutes around the clock is the single biggest variable-cost surface in an ambient assistant — 48 fires/day, every day, forever. If that agent inherits your default context (bootstrap files, memory search, full tool prompts, broad query scope), you are paying for ~150K characters of injection and unbounded tool output on every fire. Most heartbeats can and should be empty (`HEARTBEAT_OK`).
+
+This section consolidates the heartbeat-specific knobs (some appear in earlier sections) into one config recipe. Every setting starves a different cost surface. Skip any of them and the savings degrade fast.
+
+### The full agent config
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "spratt-heartbeat",
+        "model": {
+          "primary": "google/gemini-2.5-flash",
+          "fallbacks": ["anthropic/claude-haiku-4-5-20251001"]
+        },
+        "memorySearch": { "enabled": false },
+        "heartbeat": {
+          "every": "30m",
+          "model": "google/gemini-2.5-flash",
+          "prompt": "Follow HEARTBEAT.md EXACTLY. Run ONLY the commands written there. ...",
+          "isolatedSession": true,
+          "lightContext": true,
+          "suppressToolErrorWarnings": true
+        },
+        "tools": { "deny": ["write", "edit"] },
+        "workspace": "/path/to/workspace"
+      }
+    ]
+  }
+}
+```
+
+### What each setting does
+
+| Setting | What it saves |
+|---|---|
+| `model.primary: gemini-2.5-flash` | Cheapest API model for ambient orchestration. |
+| `model.fallbacks: [haiku]` | Prevents a Flash 429 from cascading to Sonnet (see #7). |
+| `memorySearch.enabled: false` | Skips the per-turn memory search call entirely. The heartbeat doesn't compose user-facing prose; it doesn't need recall. |
+| `heartbeat.isolatedSession: true` | Each fire is a fresh session, no carry-over conversation history. Combined with `ignoreSessionPatterns` (see #8), the runtime also stops accumulating these in `lcm.db`. |
+| `heartbeat.lightContext: true` | Skips bootstrap injection — no SOUL.md, AGENTS.md, TOOLS.md, IDENTITY.md, USER.md, MEMORY.md. ~150K chars saved per fire on a typical workspace. |
+| `heartbeat.suppressToolErrorWarnings: true` | Silences harmless tool errors (missing optional files, timed-out probes) so they don't pull the model into a follow-up turn to "investigate." |
+| `tools.deny: ["write", "edit"]` | Read-only watchdog. Removes the temptation for the model to "fix" something and burn extra turns. |
+
+### The prompt + scoped tool runbook
+
+The agent prompt should be one paragraph that points at a separate, fully-prescriptive runbook. Let the prompt say *only* "follow `HEARTBEAT.md` literally — never construct commands not in this file." Put every tool invocation in the runbook with exact arguments, time windows, and accounts. Example shape:
+
+```markdown
+## Check 1 — Forwarded emails
+
+gog gmail search "is:unread after:$(date -v-30M +%s)" -a forwarder@example.com
+
+Act on matches. Mark as read.
+
+## Check 2 — ...
+```
+
+Why this shape:
+- **One account, not all accounts.** The heartbeat does not need to scan every mailbox. Pick the one address used as a forwarding/inbox-of-record and search only that.
+- **`is:unread` filters out everything already actioned.** Nothing in the inbox of yesterday's mail should be re-evaluated 48 times tomorrow.
+- **`after:$(date -v-30M +%s)`, not `newer_than:30m`.** `newer_than:` silently fails when combined with other Gmail operators (see #8) and dumps the full inbox into context.
+- **Headers only.** `gog gmail search` returns ~250 bytes per email by default — enough to triage. Reading bodies is what the email-scan pipeline does on its own schedule (see #15), not the heartbeat.
+- **No SQLite queries.** The runbook should explicitly forbid the agent from inventing `sqlite3` commands. Other systems own those databases.
+
+### Fold the heartbeat into `ignoreSessionPatterns`
+
+Even with `isolatedSession: true` and `lightContext: true`, the gateway will still hand turn data to the context engine for ingestion unless told otherwise. Add the heartbeat's session key prefix to `ignoreSessionPatterns` (see #8):
+
+```json
+"ignoreSessionPatterns": [
+  "agent:*:cron:**",
+  "agent:spratt-heartbeat:**"
+]
+```
+
+Without this, the heartbeat agent's session_key reuses across fires and `lcm.db` grows linearly with every beat.
+
+### What we measured
+
+Before this configuration: heartbeat conversations had accumulated 7,535 messages over 19 days, replaying all of them as input every 30 minutes. Cost was material on Flash and would have been catastrophic on Haiku.
+
+After this configuration: each fire injects only the tightly-scoped prompt + runbook + the heartbeat's own tool output. We empirically verified post-config: gateway log shows the heartbeat firing on schedule, `lcm.db` row counts and `updated_at` timestamps for the heartbeat's conversation row do not advance, message counts stay flat. Most fires return a single `HEARTBEAT_OK` token.
+
+### When this pattern applies more broadly
+
+Any always-on, fixed-schedule agent that mostly observes (no-op, OK, "nothing to report") fits this shape:
+
+- Health monitors and watchdogs
+- Inventory/queue probes
+- Alert correlators
+
+Conversely, do **not** apply this pattern to agents that compose user-facing prose every turn (briefings, digests). They legitimately need the bootstrap and memory.
+
+---
+
 ## Summary
 
 | Technique | What It Does | Savings |
@@ -758,7 +913,7 @@ Do not move deterministic shell scripts to Codex. Move only the language/extract
 | lightContext | Minimal bootstrap for cron jobs | ~80% per cron turn |
 | Bootstrap optimization | Move reference data to lazy-loaded skills | ~15-20% per turn |
 | Fallback chain | Flash -> Haiku (not Sonnet) on 429s | Prevents 10x spike events |
-| Session cleanup | Daily cron session rot prevention | Prevented a 16x cost spike ($4 → $65/mo) |
+| Session cleanup | `ignoreSessionPatterns` (0.9.4+) plus daily cleanup | Prevented a 16x cost spike ($4 → $65/mo) |
 | Reply suppression | No intermediate messages | Reduces output + history |
 | Subagent assignment | Flash for all subagents | ~10x vs. Sonnet |
 | Compaction | Haiku-based summarization | Cheap context management |
@@ -766,6 +921,7 @@ Do not move deterministic shell scripts to Codex. Move only the language/extract
 | Prompt compression | Terse prompts, pre-structured data | Per-prompt savings |
 | Session reset | Idle session reset | Prevents stale carry |
 | Codex for extraction | Move high-volume language extraction off metered Gemini | Removed an observed ~$80/mo variable API workload |
+| Ambient monitor config | Starve every context surface on the heartbeat agent | Eliminated bootstrap, memory search, tool noise, and lcm.db growth on a 48-fire/day Gemini agent |
 
 ---
 
